@@ -1,0 +1,185 @@
+Web ini punya 2 mode:
+1. Mode: Simulasi FE -> Bisa langsung dipakai tanpa install Backend.
+2. Mode: AI Model    -> Deteksi asli pakai YOLOv11s + BoT-SORT (butuh Backend Python).
+
+--------------------------------------------------------------------
+LANGKAH 1: MENJALANKAN FRONTEND (urban-night-fe)
+--------------------------------------------------------------------
+1. Buka folder "urban-night-fe" di VS Code.
+2. Buka Terminal, lalu jalankan:
+   npm install
+   npm run dev
+3. Buka link http://localhost:5173/ di browser.
+   - Kalau mau pakai mode simulasi saja: klik tombol "Mode: AI Model"
+     di pojok kanan atas sampai berubah jadi "Mode: Simulasi FE", lalu
+     klik "Mulai hitung".
+
+--------------------------------------------------------------------
+LANGKAH 2: MEMBUAT & MENJALANKAN BACKEND AI (urban-night-be)
+--------------------------------------------------------------------
+Agar fitur deteksi model YOLOv11s berjalan, buat folder terpisah di luar
+folder "urban-night-fe" (sejajar dengan folder ini):
+
+1. Buat folder baru bernama: urban-night-be
+2. Masukkan file model (.pt) yang sudah di-training (misal: best_yolo11s_night.pt)
+   ke dalam folder "urban-night-be".
+   *(Jika belum punya file .pt custom, kode di bawah otomatis akan
+   mengunduh model bawaan yolo11s.pt).*
+3. Di dalam folder "urban-night-be", buat file bernama: main.py
+4. Salin kode Python berikut ke dalam file main.py:
+
+--- MULAI SALIN KODE main.py ---
+import os
+import cv2
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from ultralytics import YOLO
+
+app = FastAPI(title="Urban Night Local API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+CANDIDATE_MODELS = [
+    "best_yolo11s_night.pt",
+    "best_sementara.pt",
+    "best.pt",
+    "yolo11s.pt",
+]
+MODEL_PATH = next((p for p in CANDIDATE_MODELS if os.path.exists(p)), "yolo11s.pt")
+print(f"Memuat model: {MODEL_PATH}")
+model = YOLO(MODEL_PATH)
+
+sessions = {}
+
+def get_session(session_id: str):
+    if session_id not in sessions:
+        sessions[session_id] = {"prev_y": {}, "counted_ids": set()}
+    return sessions[session_id]
+
+@app.get("/api/status")
+async def get_status():
+    return {
+        "status": "online",
+        "model": os.path.basename(MODEL_PATH),
+        "classes": model.names,
+    }
+
+@app.post("/api/predict/frame")
+async def predict_frame(
+    file: UploadFile = File(...),
+    session_id: str = Form("default"),
+    line_y_ratio: float = Form(0.66),
+    conf: float = Form(0.35),
+):
+    image_bytes = await file.read()
+    frame = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    h, w, _ = frame.shape
+    line_y = line_y_ratio * h
+    session = get_session(session_id)
+
+    results = model.track(
+        source=frame,
+        persist=True,
+        tracker="botsort.yaml",
+        imgsz=640,
+        conf=conf,
+        iou=0.5,
+        verbose=False,
+    )
+
+    detections, newly_crossed = [], []
+
+    if results and results[0].boxes is not None and results[0].boxes.id is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        track_ids = results[0].boxes.id.int().cpu().tolist()
+        cls_ids = results[0].boxes.cls.int().cpu().tolist()
+        confs = results[0].boxes.conf.cpu().tolist()
+
+        for box, track_id, cls_id, score in zip(boxes, track_ids, cls_ids, confs):
+            x1, y1, x2, y2 = map(float, box)
+            cls_name = str(model.names.get(cls_id, f"class_{cls_id}"))
+            bottom_y = y2
+
+            prev_y = session["prev_y"].get(track_id)
+            if prev_y is not None:
+                crossed = (prev_y < line_y <= bottom_y) or (prev_y > line_y >= bottom_y)
+                if crossed and track_id not in session["counted_ids"]:
+                    session["counted_ids"].add(track_id)
+                    newly_crossed.append({"class_id": cls_id, "class_name": cls_name})
+
+            session["prev_y"][track_id] = bottom_y
+            detections.append({
+                "track_id": track_id,
+                "class_id": cls_id,
+                "class_name": cls_name,
+                "conf": round(score, 2),
+                "x": x1, "y": y1,
+                "w": x2 - x1, "h": y2 - y1,
+            })
+
+    return {"detections": detections, "newly_crossed": newly_crossed}
+
+@app.post("/api/predict/image")
+async def predict_image(
+    file: UploadFile = File(...),
+    line_y_ratio: float = Form(0.66),
+    conf: float = Form(0.35),
+):
+    image_bytes = await file.read()
+    frame = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    h, w, _ = frame.shape
+    line_y = line_y_ratio * h
+
+    results = model.predict(source=frame, imgsz=640, conf=conf, verbose=False)
+    detections, newly_crossed = [], []
+
+    if results and results[0].boxes is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        cls_ids = results[0].boxes.cls.int().cpu().tolist()
+        confs = results[0].boxes.conf.cpu().tolist()
+
+        for idx, (box, cls_id, score) in enumerate(zip(boxes, cls_ids, confs)):
+            x1, y1, x2, y2 = map(float, box)
+            cls_name = str(model.names.get(cls_id, f"class_{cls_id}"))
+            if y1 <= line_y <= y2 or y2 >= line_y:
+                newly_crossed.append({"class_id": cls_id, "class_name": cls_name})
+            detections.append({
+                "track_id": idx + 1,
+                "class_id": cls_id,
+                "class_name": cls_name,
+                "conf": round(score, 2),
+                "x": x1, "y": y1,
+                "w": x2 - x1, "h": y2 - y1,
+            })
+
+    return {"detections": detections, "newly_crossed": newly_crossed}
+
+@app.post("/api/reset/{session_id}")
+async def reset_session(session_id: str):
+    sessions.pop(session_id, None)
+    return {"status": "reset_ok"}
+--- AKHIR SALIN KODE main.py ---
+
+5. Buka terminal di dalam folder "urban-night-be", install library Python (cukup sekali):
+   python -m pip install ultralytics lap fastapi uvicorn python-multipart opencv-python-headless
+
+6. Jalankan server Backend lokal:
+   python -m uvicorn main:app --host 127.0.0.1 --port 8000
+
+--------------------------------------------------------------------
+LANGKAH 3: MENGHUBUNGKAN FRONTEND KE BACKEND
+--------------------------------------------------------------------
+1. Pastikan status di web Urban Night berada di "Mode: AI Model".
+2. Pada kotak input link di bar atas, ketik:
+   http://127.0.0.1:8000
+3. Klik "Hubungkan Model" sampai berubah menjadi "Server Terhubung" (hijau).
+4. Unggah video/foto atau nyalakan Live Camera, atur posisi Garis Putih,
+   lalu klik "Mulai hitung".
+====================================================================
